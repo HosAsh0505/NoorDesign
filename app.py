@@ -1,7 +1,16 @@
-from flask import Flask, request, jsonify, render_template, redirect, url_for, session
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    render_template,
+    redirect,
+    url_for,
+    session
+)
+
+import os
 import re
 import ipaddress
-import paramiko
 import time
 import threading
 import csv
@@ -10,20 +19,83 @@ import urllib.request
 import urllib.error
 import json
 
-app = Flask(__name__)
-app.secret_key = "NET_ENGINE_SUPER_SECRET_KEY_1992"
 
-devices = []
-discovery_finished = False
+# ============================================================
+# Flask
+# ============================================================
+
+app = Flask(__name__)
+
+app.secret_key = os.getenv(
+    "FLASK_SECRET_KEY",
+    "CHANGE_THIS_SECRET_KEY"
+)
+
+
+# ============================================================
+# Network / Agent Configuration
+# ============================================================
+
 FIREWALL_IP = "10.9.9.111"
 
+AGENT_TOKEN = os.getenv(
+    "NOOR_AGENT_TOKEN",
+    "CHANGE_THIS_AGENT_TOKEN"
+)
+
+
+# ============================================================
+# Global Discovery State
+# ============================================================
+
+devices = []
+
+discovery_finished = False
+
+discovery_error = None
+
+discovery_lock = threading.Lock()
+
+
+# ============================================================
+# Agent State
+# ============================================================
+
+agent_status = {
+    "online": False,
+    "agent_id": None,
+    "hostname": None,
+    "last_seen": 0,
+    "registered_at": 0
+}
+
+agent_jobs = []
+
+agent_results = {}
+
+agent_lock = threading.Lock()
+
+
+# ============================================================
+# Live Router Sessions
+#
+# IMPORTANT:
+# These are now maintained by agent.py.
+# app.py only sends commands to the agent.
+# ============================================================
+
+# Kept here only for compatibility / future usage.
 live_sessions = {}
 
-# =====================================================
-# Google Sheets / Routers Database
-# =====================================================
 
-GOOGLE_SHEET_ID = "1ymyplhGKoGxXpqQpK68sZMVTLHua7-MqrKars93QOTg"
+# ============================================================
+# Google Sheet Router Inventory
+# ============================================================
+
+GOOGLE_SHEET_ID = (
+    "1ymyplhGKoGxXpqQpK68sZMVTLHua7-MqrKars93QOTg"
+)
+
 GOOGLE_SHEET_GID = "0"
 
 GOOGLE_SHEET_CSV_URL = (
@@ -33,1173 +105,1009 @@ GOOGLE_SHEET_CSV_URL = (
 
 ROUTERS_JSON_FILE = "routers.json"
 
-# Cached router inventory
 router_inventory = []
+
 router_inventory_lock = threading.Lock()
 
 
+# ============================================================
+# Vendor Normalization
+# ============================================================
+
 def normalize_vendor(vendor):
-    """
-    Converts different vendor names from Google Sheet
-    into the exact vendor names used by the application.
-    """
 
     if not vendor:
-        return ""
+        return "Unknown"
 
-    v = vendor.strip().lower()
+    v = str(vendor).strip().lower()
 
-    # Normalize separators
-    v_normalized = re.sub(r"[^a-z0-9]+", " ", v).strip()
-    parts = v_normalized.split()
-
-    # FortiGate
     if (
-        "forti" in v_normalized
-        or "fortigate" in v_normalized
+        "forti" in v
+        or "fortigate" in v
     ):
         return "Forti"
 
-    # Juniper / Junos
     if (
-        "juniper" in v_normalized
-        or "junos" in v_normalized
+        "juniper" in v
+        or "junos" in v
+        or "mx" == v
+        or v.startswith("mx")
     ):
         return "Juniper"
 
-    # Huawei / VRP
     if (
-        "huawei" in v_normalized
-        or "vrp" in v_normalized
+        "huawei" in v
+        or "vrp" in v
+        or "ne40" in v
+        or "ar" == v
     ):
         return "Huawei"
 
-    # Cisco IOS XR
     if (
-        "xr" in parts
-        or "ios xr" in v_normalized
-        or "cisco xr" in v_normalized
+        "ios xr" in v
+        or v == "xr"
+        or "xrv" in v
+        or "iosxr" in v
     ):
         return "XR"
 
-    # Cisco IOS XE
     if (
-        "xe" in parts
-        or "ios xe" in v_normalized
-        or "cisco xe" in v_normalized
+        "ios xe" in v
+        or v == "xe"
+        or "cisco xe" in v
+        or "asr" in v
+        or "isr" in v
     ):
         return "XE"
 
-    # Already correct names
-    if v_normalized == "forti":
-        return "Forti"
+    return str(vendor).strip()
 
-    if v_normalized == "juniper":
-        return "Juniper"
 
-    if v_normalized == "huawei":
-        return "Huawei"
-
-    if v_normalized == "xr":
-        return "XR"
-
-    if v_normalized == "xe":
-        return "XE"
-
-    # Unknown vendor:
-    # Keep original value so it can still be seen/debugged.
-    return vendor.strip()
-
+# ============================================================
+# Google Sheet Loader
+# ============================================================
 
 def load_routers_from_google_sheet():
-    """
-    Loads router inventory from Google Sheets CSV export.
-
-    Expected columns:
-        ip
-        vendor
-
-    Also supports headers such as:
-        IP
-        IP Address
-        ip address
-        Vendor
-        vendor name
-    """
-
-    print("\n=====================================================")
-    print("[ROUTER DB] Trying to load routers from Google Sheet")
-    print("=====================================================")
 
     try:
-        req = urllib.request.Request(
+
+        print("[ROUTER DB] Loading Google Sheet...")
+
+        with urllib.request.urlopen(
             GOOGLE_SHEET_CSV_URL,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "Chrome/154.0 Safari/537.36"
-                )
-            }
+            timeout=15
+        ) as response:
+
+            data = response.read().decode(
+                "utf-8-sig",
+                errors="replace"
+            )
+
+        reader = csv.DictReader(
+            io.StringIO(data)
         )
 
-        with urllib.request.urlopen(req, timeout=15) as response:
-            raw_data = response.read().decode("utf-8-sig")
-
-        if not raw_data.strip():
-            raise ValueError("Google Sheet returned an empty response.")
-
-        reader = csv.DictReader(io.StringIO(raw_data))
-
         if not reader.fieldnames:
-            raise ValueError("Google Sheet does not contain a header row.")
+            raise RuntimeError(
+                "Google Sheet has no headers"
+            )
 
-        # Normalize header names
-        header_map = {}
+        headers = [
+            str(h).strip()
+            for h in reader.fieldnames
+            if h
+        ]
 
-        for header in reader.fieldnames:
-            if header is None:
-                continue
-
-            clean_header = header.strip().lower()
-            header_map[clean_header] = header
-
-        # Find IP column
         ip_column = None
-
-        for clean_header, original_header in header_map.items():
-            if (
-                clean_header == "ip"
-                or clean_header.startswith("ip ")
-                or clean_header.startswith("ip_")
-            ):
-                ip_column = original_header
-                break
-
-        # Find Vendor column
         vendor_column = None
 
-        for clean_header, original_header in header_map.items():
-            if (
-                clean_header == "vendor"
-                or clean_header.startswith("vendor ")
-                or clean_header.startswith("vendor_")
+        for h in headers:
+
+            hl = h.lower()
+
+            if hl in (
+                "ip",
+                "ip address",
+                "router ip",
+                "address"
             ):
-                vendor_column = original_header
-                break
+                ip_column = h
+
+            if hl in (
+                "vendor",
+                "platform",
+                "device vendor",
+                "type"
+            ):
+                vendor_column = h
 
         if not ip_column:
-            raise ValueError(
-                "Google Sheet does not contain an IP column."
-            )
+
+            # Try fuzzy detection
+            for h in headers:
+
+                if "ip" in h.lower():
+                    ip_column = h
+                    break
 
         if not vendor_column:
-            raise ValueError(
-                "Google Sheet does not contain a Vendor column."
-            )
 
-        print(f"[ROUTER DB] IP column     : {ip_column}")
-        print(f"[ROUTER DB] Vendor column : {vendor_column}")
+            for h in headers:
+
+                if (
+                    "vendor" in h.lower()
+                    or "platform" in h.lower()
+                ):
+                    vendor_column = h
+                    break
+
+        if not ip_column:
+
+            raise RuntimeError(
+                "Could not find IP column in Google Sheet"
+            )
 
         routers = []
-        seen_ips = set()
 
-        for row_number, row in enumerate(reader, start=2):
+        seen = set()
 
-            ip = (row.get(ip_column) or "").strip()
-            vendor_raw = (row.get(vendor_column) or "").strip()
+        for row in reader:
 
-            # Ignore completely empty rows
-            if not ip and not vendor_raw:
-                continue
+            ip = str(
+                row.get(ip_column, "")
+            ).strip()
 
             if not ip:
-                print(
-                    f"[ROUTER DB] WARNING: Row {row_number} "
-                    f"has no IP. Skipping."
-                )
                 continue
 
-            if not vendor_raw:
-                print(
-                    f"[ROUTER DB] WARNING: Row {row_number} "
-                    f"has no Vendor. Skipping."
-                )
-                continue
-
-            # Validate IPv4 / IPv6 address
             try:
+
                 ipaddress.ip_address(ip)
+
             except ValueError:
+
                 print(
-                    f"[ROUTER DB] WARNING: Row {row_number} "
-                    f"has invalid IP: {ip}. Skipping."
+                    f"[ROUTER DB] Invalid IP skipped: {ip}"
                 )
+
                 continue
 
-            # Avoid duplicate IPs
-            if ip in seen_ips:
-                print(
-                    f"[ROUTER DB] WARNING: Duplicate IP {ip}. "
-                    f"Skipping duplicate row."
-                )
+            if ip in seen:
                 continue
 
-            seen_ips.add(ip)
+            seen.add(ip)
 
-            vendor = normalize_vendor(vendor_raw)
+            vendor = "Unknown"
 
-            routers.append(
-                {
-                    "ip": ip,
-                    "vendor": vendor
-                }
-            )
+            if vendor_column:
+                vendor = normalize_vendor(
+                    row.get(vendor_column, "")
+                )
+
+            routers.append({
+                "ip": ip,
+                "vendor": vendor
+            })
 
         if not routers:
-            raise ValueError(
-                "Google Sheet was accessible, "
-                "but no valid routers were found."
+
+            raise RuntimeError(
+                "Google Sheet returned zero routers"
             )
 
         print(
-            f"[ROUTER DB] SUCCESS: Loaded "
-            f"{len(routers)} router(s) from Google Sheet."
+            f"[ROUTER DB] Loaded {len(routers)} routers from Google Sheet"
         )
-
-        for router in routers:
-            print(
-                f"[ROUTER DB]   {router['ip']} -> "
-                f"{router['vendor']}"
-            )
-
-        print("=====================================================\n")
 
         return routers
 
-    except urllib.error.HTTPError as e:
-        print(
-            f"[ROUTER DB] Google Sheet HTTP Error: "
-            f"{e.code} - {e.reason}"
-        )
-
-    except urllib.error.URLError as e:
-        print(
-            f"[ROUTER DB] Google Sheet URL Error: "
-            f"{e.reason}"
-        )
-
     except Exception as e:
+
         print(
-            f"[ROUTER DB] Google Sheet Error: "
-            f"{str(e)}"
+            f"[ROUTER DB] Google Sheet error: {e}"
         )
 
-    print(
-        "[ROUTER DB] Google Sheet failed. "
-        "Will fallback to routers.json."
-    )
+        return []
 
-    return []
 
+# ============================================================
+# JSON Router Inventory
+# ============================================================
 
 def load_routers_from_json():
-    """
-    Fallback database.
-
-    Used ONLY when Google Sheet cannot be loaded
-    or contains no valid routers.
-    """
-
-    print("\n=====================================================")
-    print("[ROUTER DB] Loading fallback routers.json")
-    print("=====================================================")
 
     try:
+
+        if not os.path.exists(
+            ROUTERS_JSON_FILE
+        ):
+            return []
+
         with open(
             ROUTERS_JSON_FILE,
             "r",
             encoding="utf-8"
         ) as f:
-            routers_list = json.load(f)
 
-        if not isinstance(routers_list, list):
-            raise ValueError(
-                "routers.json must contain a JSON array."
-            )
+            data = json.load(f)
+
+        if not isinstance(data, list):
+            return []
 
         routers = []
-        seen_ips = set()
 
-        for router in routers_list:
+        seen = set()
 
-            if not isinstance(router, dict):
+        for item in data:
+
+            if not isinstance(item, dict):
                 continue
 
-            ip = str(router.get("ip", "")).strip()
-            vendor_raw = str(router.get("vendor", "")).strip()
+            ip = str(
+                item.get("ip", "")
+            ).strip()
 
-            if not ip or not vendor_raw:
+            if not ip:
                 continue
 
             try:
+
                 ipaddress.ip_address(ip)
+
             except ValueError:
-                print(
-                    f"[ROUTER DB] WARNING: Invalid IP in "
-                    f"routers.json: {ip}"
+                continue
+
+            if ip in seen:
+                continue
+
+            seen.add(ip)
+
+            routers.append({
+                "ip": ip,
+                "vendor": normalize_vendor(
+                    item.get("vendor", "Unknown")
                 )
-                continue
-
-            if ip in seen_ips:
-                continue
-
-            seen_ips.add(ip)
-
-            vendor = normalize_vendor(vendor_raw)
-
-            routers.append(
-                {
-                    "ip": ip,
-                    "vendor": vendor
-                }
-            )
-
-        if not routers:
-            raise ValueError(
-                "routers.json contains no valid routers."
-            )
+            })
 
         print(
-            f"[ROUTER DB] FALLBACK SUCCESS: Loaded "
-            f"{len(routers)} router(s) from routers.json."
+            f"[ROUTER DB] Loaded {len(routers)} routers from JSON"
         )
-
-        for router in routers:
-            print(
-                f"[ROUTER DB]   {router['ip']} -> "
-                f"{router['vendor']}"
-            )
-
-        print("=====================================================\n")
 
         return routers
 
-    except FileNotFoundError:
-        print(
-            f"[ROUTER DB] ERROR: {ROUTERS_JSON_FILE} "
-            f"was not found."
-        )
-
-    except json.JSONDecodeError as e:
-        print(
-            f"[ROUTER DB] ERROR: Invalid JSON in "
-            f"{ROUTERS_JSON_FILE}: {e}"
-        )
-
     except Exception as e:
+
         print(
-            f"[ROUTER DB] Error reading {ROUTERS_JSON_FILE}: "
-            f"{str(e)}"
+            f"[ROUTER DB] JSON error: {e}"
         )
 
-    return []
+        return []
 
+
+# ============================================================
+# Main Router Inventory Loader
+# ============================================================
 
 def load_router_inventory():
-    """
-    Main router database loader.
-
-    Priority:
-        1. Google Sheet
-        2. routers.json fallback
-    """
 
     global router_inventory
 
-    # =================================================
-    # FIRST: Google Sheet
-    # =================================================
-
     routers = load_routers_from_google_sheet()
 
-    # =================================================
-    # FALLBACK: routers.json
-    # =================================================
-
     if not routers:
+
+        print(
+            "[ROUTER DB] Google Sheet failed."
+            " Falling back to routers.json"
+        )
+
         routers = load_routers_from_json()
 
-    # =================================================
-    # Save in memory
-    # =================================================
-
     with router_inventory_lock:
-        router_inventory = routers
 
-    if routers:
-        print(
-            f"[ROUTER DB] Active router database contains "
-            f"{len(routers)} router(s)."
-        )
-    else:
-        print(
-            "[ROUTER DB] CRITICAL: No router database "
-            "is available."
-        )
+        router_inventory = routers
 
     return routers
 
 
-# =====================================================
-# دالات الـ Parsing الأصلية
-# =====================================================
+# ============================================================
+# Config Parsing
+# ============================================================
 
-def extract_hostname(cfg, username):
+def extract_hostname(cfg, username=""):
+
     patterns = [
-        r"hostname\s+(\S+)",
-        r"sysname\s+(.+)",
-        r"Hostname:\s*(\S+)",
-        r"root@([\w\-.]+)",
-        r"host-name\s+(\S+)",
-        r"RP/0/\S+/CPU0:([^#\s\r\n]+)#",
-        rf"{re.escape(username)}@([^>\s:]+)>",
-        r"^[^@\s]+@([^>\r\n]+)>$"
+
+        r"(?im)^\s*hostname\s+(\S+)",
+
+        r"(?im)^\s*set\s+system\s+host-name\s+(\S+)",
+
+        r"(?im)^\s*sysname\s+(\S+)",
+
+        r"(?im)^\s*config\s+system\s+global[\s\S]*?^\s*set\s+hostname\s+(\S+)",
+
+        r"(?im)^\s*Hostname:\s*(\S+)",
+
     ]
 
-    for p in patterns:
-        m = re.search(p, cfg)
+    for pattern in patterns:
 
-        if m:
-            return m.group(1).strip()
+        match = re.search(
+            pattern,
+            cfg
+        )
 
-    return "UNKNOWN"
+        if match:
 
+            return match.group(1).strip()
+
+    return username or "Unknown"
+
+
+# ============================================================
 
 def extract_version(cfg):
-    m = re.search(r"Version\s+([\S]+)", cfg)
 
-    if m:
-        return m.group(1)
+    patterns = [
 
-    m = re.search(r"Junos:\s+([\S]+)", cfg)
+        # Cisco XE
+        r"(?im)^Cisco IOS XE Software.*",
 
-    if m:
-        return m.group(1)
+        r"(?im)^Cisco IOS Software.*",
 
-    m = re.search(
-        r"!! IOS XR Configuration ([\S]+)",
-        cfg
-    )
+        # Cisco XR
+        r"(?im)^Cisco IOS XR Software.*",
 
-    if m:
-        return m.group(1)
+        # Juniper
+        r"(?im)^JUNOS.*",
 
-    m = re.search(
-        r"\[V(\d+R\d+C\d+)\]",
-        cfg
-    )
+        r"(?im)^Junos:.*",
 
-    if m:
-        return m.group(1)
+        # Huawei
+        r"(?im)^Huawei Versatile Routing Platform Software.*",
+
+        r"(?im)^VRP.*",
+
+        # FortiGate
+        r"(?im)^Version:\s*(.+)$",
+
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            cfg
+        )
+
+        if match:
+
+            return match.group(0).strip()
 
     return "Unknown"
 
 
+# ============================================================
+
 def extract_loopback(cfg):
-    m = re.search(
-        r"LoopBack0.*?ipv4 address "
-        r"(\d+\.\d+\.\d+\.\d+)",
-        cfg,
-        re.S | re.I
-    )
 
-    if m:
-        return m.group(1)
+    patterns = [
 
-    m = re.search(
-        r"Loopback0.*?ip address "
-        r"(\d+\.\d+\.\d+\.\d+)",
-        cfg,
-        re.S | re.I
-    )
+        # Cisco XE/XR
+        r"(?im)interface\s+Loopback\d+[\s\S]*?ip address\s+(\d+\.\d+\.\d+\.\d+)\s+255\.255\.255\.255",
 
-    if m:
-        return m.group(1)
+        # Cisco alternate
+        r"(?im)interface\s+Loopback\d+[\s\S]*?ipv4 address\s+(\d+\.\d+\.\d+\.\d+)/32",
 
-    m = re.search(
-        r"lo0.*?address "
-        r"(\d+\.\d+\.\d+\.\d+)",
-        cfg,
-        re.S
-    )
+        # Juniper
+        r"(?im)set interfaces lo0 unit \d+ family inet address (\d+\.\d+\.\d+\.\d+)/32",
 
-    if m:
-        return m.group(1)
+        # Huawei
+        r"(?im]interface LoopBack\d+[\s\S]*?ip address\s+(\d+\.\d+\.\d+\.\d+)\s+255\.255\.255\.255",
 
-    m = re.search(
-        r'edit\s+"loopback0".*?set ip '
-        r"(\d+\.\d+\.\d+\.\d+)",
-        cfg,
-        re.S | re.I
-    )
+        # FortiGate
+        r"(?im)set ip\s+(\d+\.\d+\.\d+\.\d+)\s+255\.255\.255\.255",
 
-    if m:
-        return m.group(1)
+    ]
 
-    return ""
+    for pattern in patterns:
 
+        match = re.search(
+            pattern,
+            cfg
+        )
+
+        if match:
+
+            return match.group(1)
+
+    return None
+
+
+# ============================================================
 
 def extract_nsap(cfg):
-    m = re.search(
-        r"net\s+(49\..+)",
-        cfg,
-        re.MULTILINE
-    )
 
-    if m:
-        return m.group(1)
+    patterns = [
 
-    m = re.search(
-        r"network-entity\s+([\d\.]+)",
-        cfg
-    )
+        # Cisco
+        r"(?im)net\s+([0-9A-Fa-f.]+)",
 
-    if m:
-        return m.group(1)
+        # Juniper
+        r"(?im)set protocols isis interface lo0.*",
 
-    m = re.search(
-        r"iso address\s+([\d\.]+)",
-        cfg
-    )
+        # Generic NSAP
+        r"(?im)\b49\.[0-9A-Fa-f.]+\b",
 
-    if m:
-        return m.group(1)
+    ]
 
-    return ""
+    for pattern in patterns:
 
+        match = re.search(
+            pattern,
+            cfg
+        )
+
+        if match:
+
+            value = match.group(1) if match.lastindex else match.group(0)
+
+            value = value.strip()
+
+            if value.lower().startswith("49."):
+                return value
+
+    return None
+
+
+# ============================================================
+# Interface Normalization
+# ============================================================
 
 def normalize_interface(name):
-    if "." in name:
-        base, sub = name.split(".", 1)
-        return base, sub
 
-    return name, None
+    if not name:
+        return name
+
+    n = name.strip()
+
+    replacements = {
+
+        "Gi": "GigabitEthernet",
+        "Te": "TenGigabitEthernet",
+        "Fo": "FortyGigabitEthernet",
+        "Hu": "HundredGigE",
+        "Eth": "Ethernet",
+        "GE": "GigabitEthernet",
+        "XGE": "TenGigabitEthernet",
+    }
+
+    for old, new in replacements.items():
+
+        if n.startswith(old):
+
+            return new + n[len(old):]
+
+    return n
 
 
-def parse_isis_interfaces(cfg, vendor):
+# ============================================================
+# ISIS Parser
+# ============================================================
+
+def parse_isis_interfaces(
+    cfg,
+    vendor
+):
+
     interfaces = []
 
-    # =================================================
-    # Cisco IOS XE
-    # =================================================
+    vendor = normalize_vendor(vendor)
+
+    # ========================================================
+    # Cisco XE
+    # ========================================================
 
     if vendor == "XE":
 
         blocks = re.findall(
-            r"interface (\S+)(.*?)!",
-            cfg,
-            re.S
-        )
-
-        for name, block in blocks:
-
-            if "ip router isis" in block:
-
-                m = re.search(
-                    r"ip address (\S+) (\S+)",
-                    block
-                )
-
-                if m:
-                    ip, mask = m.group(1), m.group(2)
-
-                    net = ipaddress.IPv4Network(
-                        f"{ip}/{mask}",
-                        strict=False
-                    )
-
-                    base, sub = normalize_interface(name)
-
-                    interfaces.append(
-                        {
-                            "name": name,
-                            "base": base,
-                            "sub": sub,
-                            "ip": ip,
-                            "network": str(net)
-                        }
-                    )
-
-    # =================================================
-    # Cisco IOS XR
-    # =================================================
-
-    elif vendor == "XR":
-
-        isis_block = re.search(
-            r"router isis.*?(?=\n\S)",
-            cfg,
-            re.S
-        )
-
-        isis_intfs = []
-
-        if isis_block:
-
-            for line in isis_block.group(0).splitlines():
-
-                line = line.strip()
-
-                if line.startswith("interface"):
-                    isis_intfs.append(
-                        line.split()[1]
-                    )
-
-        blocks = re.findall(
-            r"interface (\S+)(.*?)!",
-            cfg,
-            re.S
-        )
-
-        for name, block in blocks:
-
-            if name in isis_intfs:
-
-                m = re.search(
-                    r"ipv4 address (\S+) (\S+)",
-                    block
-                )
-
-                if m:
-
-                    ip, mask = (
-                        m.group(1),
-                        m.group(2)
-                    )
-
-                    net = ipaddress.IPv4Network(
-                        f"{ip}/{mask}",
-                        strict=False
-                    )
-
-                    base, sub = normalize_interface(name)
-
-                    interfaces.append(
-                        {
-                            "name": name,
-                            "base": base,
-                            "sub": sub,
-                            "ip": ip,
-                            "network": str(net)
-                        }
-                    )
-
-    # =================================================
-    # Juniper
-    # =================================================
-
-    elif vendor == "Juniper":
-
-        iso_interfaces = re.findall(
-            r"set interfaces (\S+) "
-            r"unit (\S+) family iso",
+            r"(?ims)^interface\s+(\S+)(.*?)(?=^interface\s+|\Z)",
             cfg
         )
 
-        for base, unit in iso_interfaces:
+        for interface, body in blocks:
 
-            intf = f"{base}.{unit}"
+            if re.search(
+                r"(?im)^\s*ip router isis",
+                body
+            ):
 
-            m = re.search(
-                rf"set interfaces "
-                rf"{re.escape(base)} "
-                rf"unit {re.escape(unit)} "
-                rf"family inet address (\S+)",
+                interfaces.append(
+                    normalize_interface(interface)
+                )
+
+            elif re.search(
+                r"(?im)^\s*isis\s+enable",
+                body
+            ):
+
+                interfaces.append(
+                    normalize_interface(interface)
+                )
+
+    # ========================================================
+    # Cisco XR
+    # ========================================================
+
+    elif vendor == "XR":
+
+        blocks = re.findall(
+            r"(?ims)^interface\s+(\S+)(.*?)(?=^interface\s+|\Z)",
+            cfg
+        )
+
+        for interface, body in blocks:
+
+            if re.search(
+                r"(?im)isis\s+\S+",
+                body
+            ):
+
+                interfaces.append(
+                    normalize_interface(interface)
+                )
+
+    # ========================================================
+    # Juniper
+    # ========================================================
+
+    elif vendor == "Juniper":
+
+        patterns = [
+
+            r"(?im)^set protocols isis interface (\S+)",
+
+            r"(?im)^set protocols isis interface (\S+)\s",
+
+        ]
+
+        for pattern in patterns:
+
+            matches = re.findall(
+                pattern,
                 cfg
             )
 
-            if m:
+            for interface in matches:
 
-                ip_net = m.group(1)
+                interface = interface.strip()
 
-                ip = ip_net.split("/")[0]
+                if interface not in interfaces:
 
-                interfaces.append(
-                    {
-                        "name": intf,
-                        "base": base,
-                        "sub": unit,
-                        "ip": ip,
-                        "network": str(
-                            ipaddress.ip_interface(
-                                ip_net
-                            ).network
-                        )
-                    }
-                )
+                    interfaces.append(
+                        normalize_interface(interface)
+                    )
 
-    # =================================================
+    # ========================================================
     # Huawei
-    # =================================================
+    # ========================================================
 
     elif vendor == "Huawei":
 
         blocks = re.findall(
-            r"interface (\S+)(.*?)#",
-            cfg,
-            re.S
+            r"(?ims)^interface\s+(\S+)(.*?)(?=^interface\s+|\Z)",
+            cfg
         )
 
-        for name, block in blocks:
+        for interface, body in blocks:
 
-            if "isis enable" in block:
+            if re.search(
+                r"(?im)isis\s+enable",
+                body
+            ):
 
-                m = re.search(
-                    r"ip address (\S+) (\S+)",
-                    block
+                interfaces.append(
+                    normalize_interface(interface)
                 )
 
-                if m:
-
-                    ip, mask = (
-                        m.group(1),
-                        m.group(2)
-                    )
-
-                    net = ipaddress.IPv4Network(
-                        f"{ip}/{mask}",
-                        strict=False
-                    )
-
-                    base, sub = normalize_interface(name)
-
-                    interfaces.append(
-                        {
-                            "name": name,
-                            "base": base,
-                            "sub": sub,
-                            "ip": ip,
-                            "network": str(net)
-                        }
-                    )
-
-    # =================================================
+    # ========================================================
     # FortiGate
-    # =================================================
+    # ========================================================
 
     elif vendor == "Forti":
 
-        isis_block = re.search(
-            r"config router isis(.*?)end",
-            cfg,
-            re.S
-        )
-
-        isis_intfs = []
-
-        if isis_block:
-            isis_intfs = re.findall(
-                r'edit\s+"(.*?)"',
-                isis_block.group(1)
-            )
-
         blocks = re.findall(
-            r'edit\s+"(.*?)"(.*?)next',
-            cfg,
-            re.S
+            r"(?ims)edit\s+\"([^\"]+)\"(.*?)(?=^\s*edit\s+\"|\Z)",
+            cfg
         )
 
-        for name, block in blocks:
+        for interface, body in blocks:
 
-            if name in isis_intfs:
+            if re.search(
+                r"(?im)set\s+network-type\s+point-to-point",
+                body
+            ):
 
-                m = re.search(
-                    r"set ip "
-                    r"(\d+\.\d+\.\d+\.\d+) "
-                    r"(\d+\.\d+\.\d+\.\d+)",
-                    block
-                )
+                interfaces.append(interface)
 
-                if m:
+    return list(
+        dict.fromkeys(interfaces)
+    )
 
-                    ip, mask = (
-                        m.group(1),
-                        m.group(2)
-                    )
 
-                    net = ipaddress.IPv4Network(
-                        f"{ip}/{mask}",
-                        strict=False
-                    )
-
-                    base, sub = normalize_interface(name)
-
-                    interfaces.append(
-                        {
-                            "name": name,
-                            "base": base,
-                            "sub": sub,
-                            "ip": ip,
-                            "network": str(net)
-                        }
-                    )
-
-    return interfaces
-
+# ============================================================
+# Build ISIS Links
+# ============================================================
 
 def build_links(devices_list):
 
-    grouped = {}
+    links = []
 
-    for d1 in devices_list:
+    # --------------------------------------------------------
+    # First attempt:
+    # Match interfaces that have common ISIS network metadata
+    # --------------------------------------------------------
 
-        for i1 in d1["isis_interfaces"]:
+    network_map = {}
 
-            try:
-                net1 = ipaddress.ip_network(
-                    i1["network"],
-                    strict=False
-                )
-            except Exception:
+    for device in devices_list:
+
+        isis_interfaces = device.get(
+            "isis_interfaces",
+            []
+        )
+
+        for interface in isis_interfaces:
+
+            key = interface.strip()
+
+            if not key:
                 continue
 
-            for d2 in devices_list:
+            network_map.setdefault(
+                key,
+                []
+            ).append(
+                device
+            )
 
-                if d1["hostname"] == d2["hostname"]:
+    # --------------------------------------------------------
+    # Create links
+    # --------------------------------------------------------
+
+    seen = set()
+
+    for key, members in network_map.items():
+
+        if len(members) < 2:
+            continue
+
+        for i in range(
+            len(members)
+        ):
+
+            for j in range(
+                i + 1,
+                len(members)
+            ):
+
+                a = members[i]
+                b = members[j]
+
+                a_id = (
+                    a.get("loopback")
+                    or a.get("ip")
+                    or a.get("hostname")
+                )
+
+                b_id = (
+                    b.get("loopback")
+                    or b.get("ip")
+                    or b.get("hostname")
+                )
+
+                if not a_id or not b_id:
                     continue
 
-                for i2 in d2["isis_interfaces"]:
-
-                    try:
-                        net2 = ipaddress.ip_network(
-                            i2["network"],
-                            strict=False
-                        )
-                    except Exception:
-                        continue
-
-                    if net1 != net2:
-                        continue
-
-                    pair = tuple(
-                        sorted(
-                            [
-                                d1["hostname"],
-                                d2["hostname"]
-                            ]
-                        )
+                pair = tuple(
+                    sorted(
+                        [str(a_id), str(b_id)]
                     )
+                )
 
-                    if pair not in grouped:
+                if pair in seen:
+                    continue
 
-                        grouped[pair] = {
-                            "from": pair[0],
-                            "to": pair[1],
-                            "connections": []
-                        }
+                seen.add(pair)
 
-                    conn = {
-                        "network": str(net1),
-                        "routerA": d1["hostname"],
-                        "routerB": d2["hostname"],
-                        "interfaceA": (
-                            f'{i1["name"]} - '
-                            f'{i1["ip"]}'
-                        ),
-                        "interfaceB": (
-                            f'{i2["name"]} - '
-                            f'{i2["ip"]}'
-                        )
-                    }
+                links.append({
+                    "source": a_id,
+                    "target": b_id,
+                    "network": key
+                })
 
-                    network_exists = False
-
-                    for existing in grouped[pair]["connections"]:
-
-                        if existing["network"] == conn["network"]:
-                            network_exists = True
-                            break
-
-                    if network_exists:
-                        continue
-
-                    grouped[pair]["connections"].append(conn)
-
-    return list(grouped.values())
+    return links
 
 
-# =====================================================
-# Discovery
-# =====================================================
+# ============================================================
+# Agent Authentication
+# ============================================================
 
-def fetch_config_via_ssh_tunnel(
-    chan,
-    ip,
-    vendor,
-    username,
-    password
+def verify_agent_token(req):
+
+    token = req.headers.get(
+        "X-Agent-Token",
+        ""
+    )
+
+    if not token:
+
+        auth = req.headers.get(
+            "Authorization",
+            ""
+        )
+
+        if auth.startswith("Bearer "):
+
+            token = auth[
+                len("Bearer "):
+            ].strip()
+
+    return (
+        token
+        and token == AGENT_TOKEN
+    )
+
+
+# ============================================================
+# Agent Job Creation
+# ============================================================
+
+def create_agent_job(
+    job_type,
+    payload
 ):
 
-    try:
+    job_id = (
+        f"{int(time.time() * 1000)}"
+        f"-{os.urandom(4).hex()}"
+    )
 
-        if chan.recv_ready():
-            chan.recv(65535)
+    job = {
+        "job_id": job_id,
+        "type": job_type,
+        "payload": payload,
+        "created_at": time.time()
+    }
 
-        chan.send(f"telnet {ip}\n")
+    with agent_lock:
 
-        output = ""
+        agent_jobs.append(job)
 
-        timeout = 10
-        start_time = time.time()
+    return job_id
 
-        while time.time() - start_time < timeout:
 
-            if chan.recv_ready():
+# ============================================================
+# Wait For Agent Result
+# ============================================================
 
-                output += chan.recv(
-                    65535
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
+def wait_for_agent_result(
+    job_id,
+    timeout=300
+):
+
+    started = time.time()
+
+    while (
+        time.time() - started
+        < timeout
+    ):
+
+        with agent_lock:
+
+            result = agent_results.get(
+                job_id
+            )
+
+            if result is not None:
+
+                # Remove after consuming
+                agent_results.pop(
+                    job_id,
+                    None
                 )
 
-                if re.search(
-                    r"[Uu]sername:|[L|l]ogin:",
-                    output
-                ):
-                    break
+                return result
 
-            time.sleep(0.5)
+        time.sleep(0.5)
 
-        chan.send(f"{username}\n")
+    return {
+        "success": False,
+        "error": "Agent job timeout"
+    }
 
-        time.sleep(1)
 
-        output = ""
+# ============================================================
+# Agent Register
+# ============================================================
 
-        start_time = time.time()
+@app.route(
+    "/agent/register",
+    methods=["POST"]
+)
+def agent_register():
 
-        while time.time() - start_time < timeout:
+    if not verify_agent_token(request):
 
-            if chan.recv_ready():
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized"
+        }), 401
 
-                output += chan.recv(
-                    65535
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
-                )
+    data = request.get_json(
+        silent=True
+    ) or {}
 
-                if (
-                    "Password:" in output
-                    or "password:" in output
-                ):
-                    break
+    agent_id = data.get(
+        "agent_id"
+    )
 
-            time.sleep(0.5)
+    hostname = data.get(
+        "hostname"
+    )
 
-        chan.send(f"{password}\n")
+    with agent_lock:
 
-        time.sleep(3)
+        agent_status["online"] = True
 
-        if chan.recv_ready():
-            chan.recv(65535)
+        agent_status["agent_id"] = agent_id
 
-        # =================================================
-        # Prepare terminal
-        # =================================================
+        agent_status["hostname"] = hostname
 
-        if vendor in ["XE", "XR"]:
+        agent_status["last_seen"] = time.time()
 
-            chan.send(
-                "terminal length 0\n"
+        agent_status["registered_at"] = time.time()
+
+    print(
+        f"[AGENT] Registered: {agent_id}"
+    )
+
+    return jsonify({
+        "success": True,
+        "message": "Agent registered",
+        "server_time": time.time()
+    })
+
+
+# ============================================================
+# Agent Poll
+# ============================================================
+
+@app.route(
+    "/agent/poll",
+    methods=["GET"]
+)
+def agent_poll():
+
+    if not verify_agent_token(request):
+
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized"
+        }), 401
+
+    with agent_lock:
+
+        agent_status["online"] = True
+
+        agent_status["last_seen"] = time.time()
+
+        if agent_jobs:
+
+            job = agent_jobs.pop(
+                0
             )
 
-            time.sleep(1)
+        else:
 
-            chan.send(
-                "show run\n"
-            )
+            job = None
 
-        elif vendor == "Juniper":
+    if job:
 
-            chan.send(
-                "show configuration | "
-                "display set | no-more\n"
-            )
+        return jsonify({
+            "success": True,
+            "job": job
+        })
 
-        elif vendor == "Huawei":
+    return jsonify({
+        "success": True,
+        "job": None
+    })
 
-            chan.send(
-                "screen-length 0 temporary\n"
-            )
 
-            time.sleep(1)
+# ============================================================
+# Agent Result
+# ============================================================
 
-            chan.send(
-                "display current-config\n"
-            )
+@app.route(
+    "/agent/result",
+    methods=["POST"]
+)
+def agent_result():
 
-        elif vendor == "Forti":
+    if not verify_agent_token(request):
 
-            chan.send(
-                "show\n"
-            )
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized"
+        }), 401
 
-        # =================================================
-        # Collect config
-        # =================================================
+    data = request.get_json(
+        silent=True
+    ) or {}
 
-        config_data = ""
+    job_id = data.get(
+        "job_id"
+    )
 
-        max_wait_time = 180
+    if not job_id:
 
-        start_collect = time.time()
+        return jsonify({
+            "success": False,
+            "error": "Missing job_id"
+        }), 400
 
-        time.sleep(3)
+    result = data.get(
+        "result",
+        {}
+    )
 
-        while True:
+    with agent_lock:
 
-            if (
-                time.time() - start_collect
-                > max_wait_time
-            ):
-                break
+        agent_results[job_id] = result
 
-            if chan.recv_ready():
+        agent_status["online"] = True
 
-                config_data += chan.recv(
-                    65535
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
-                )
+        agent_status["last_seen"] = time.time()
 
-            else:
+    return jsonify({
+        "success": True
+    })
 
-                last_lines = (
-                    config_data[-100:]
-                    if len(config_data) > 100
-                    else config_data
-                )
 
-                if (
-                    len(config_data) > 500
-                    and (
-                        last_lines.strip().endswith("#")
-                        or last_lines.strip().endswith(">")
-                        or "end" in last_lines.lower()
-                    )
-                ):
+# ============================================================
+# Agent Status
+# ============================================================
 
-                    time.sleep(1)
+@app.route(
+    "/agent/status",
+    methods=["GET"]
+)
+def get_agent_status():
 
-                    if not chan.recv_ready():
-                        break
+    with agent_lock:
 
-                time.sleep(1)
-
-        extracted_name = extract_hostname(
-            config_data,
-            username
+        status = dict(
+            agent_status
         )
 
-        # =================================================
-        # ISIS logs
-        # =================================================
+    # Consider agent offline after 15 seconds
+    if (
+        time.time()
+        - status["last_seen"]
+        > 15
+    ):
 
-        log_command = ""
+        status["online"] = False
 
-        if vendor in ["XE", "XR"]:
+    return jsonify(
+        status
+    )
 
-            log_command = (
-                "show logging | include ISIS\n"
-            )
 
-        elif vendor == "Juniper":
-
-            log_command = (
-                'show log messages | '
-                'match "ISIS" | no-more\n'
-            )
-
-        elif vendor == "Huawei":
-
-            log_command = (
-                "display logbuffer | include ISIS\n"
-            )
-
-        log_data = ""
-
-        if log_command:
-
-            if chan.recv_ready():
-                chan.recv(65535)
-
-            chan.send(log_command)
-
-            time.sleep(4)
-
-            start_collect_logs = time.time()
-
-            max_log_wait = 25
-
-            while (
-                time.time() - start_collect_logs
-                < max_log_wait
-            ):
-
-                if chan.recv_ready():
-
-                    log_data += chan.recv(
-                        65535
-                    ).decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
-
-                    start_collect_logs = time.time()
-
-                else:
-
-                    time.sleep(1.0)
-
-                    if not chan.recv_ready():
-                        break
-
-            log_data = log_data.replace(
-                log_command.strip(),
-                ""
-            )
-
-        # =================================================
-        # Exit Telnet
-        # =================================================
-
-        chan.send("exit\n")
-
-        time.sleep(1)
-
-        if chan.recv_ready():
-            chan.recv(65535)
-
-        return {
-            "config": config_data,
-            "logs": log_data,
-            "forced_hostname": extracted_name
-        }
-
-    except Exception as e:
-
-        print(
-            f"Error tunneling telnet for "
-            f"{ip}: {e}"
-        )
-
-        return None
-
+# ============================================================
+# Network Discovery Worker
+# ============================================================
 
 def network_discovery_worker(
     username,
@@ -1208,571 +1116,703 @@ def network_discovery_worker(
 
     global devices
     global discovery_finished
+    global discovery_error
 
     discovery_finished = False
-
-    # =================================================
-    # Load router database
-    #
-    # Google Sheet first
-    # routers.json fallback
-    # =================================================
-
-    routers_list = load_router_inventory()
-
-    if not routers_list:
-
-        print(
-            "[DISCOVERY] No routers available "
-            "from Google Sheet or routers.json."
-        )
-
-        discovery_finished = True
-        return
+    discovery_error = None
 
     try:
 
-        ssh = paramiko.SSHClient()
-
-        ssh.set_missing_host_key_policy(
-            paramiko.AutoAddPolicy()
+        print(
+            "[DISCOVERY] Starting discovery through Agent..."
         )
 
-        ssh.connect(
-            FIREWALL_IP,
-            username=username,
-            password=password,
-            timeout=10
+        # ----------------------------------------------------
+        # Check Agent
+        # ----------------------------------------------------
+
+        with agent_lock:
+
+            last_seen = agent_status.get(
+                "last_seen",
+                0
+            )
+
+            is_online = (
+                agent_status.get(
+                    "online",
+                    False
+                )
+                and
+                (
+                    time.time()
+                    - last_seen
+                    <= 15
+                )
+            )
+
+        if not is_online:
+
+            raise RuntimeError(
+                "Network Agent is offline"
+            )
+
+        # ----------------------------------------------------
+        # Load Router Inventory
+        # ----------------------------------------------------
+
+        routers = load_router_inventory()
+
+        if not routers:
+
+            raise RuntimeError(
+                "Router inventory is empty"
+            )
+
+        print(
+            f"[DISCOVERY] Sending {len(routers)} routers to Agent"
         )
 
-        chan = ssh.invoke_shell()
+        # ----------------------------------------------------
+        # Create Discovery Job
+        # ----------------------------------------------------
 
-        time.sleep(1)
+        payload = {
+            "firewall_ip": FIREWALL_IP,
+            "username": username,
+            "password": password,
+            "routers": routers
+        }
 
-        if chan.recv_ready():
-            chan.recv(65535)
+        job_id = create_agent_job(
+            "discovery",
+            payload
+        )
 
-        # =================================================
-        # Discover each router
-        # =================================================
+        print(
+            f"[DISCOVERY] Job ID: {job_id}"
+        )
 
-        for router in routers_list:
+        # ----------------------------------------------------
+        # Wait
+        # ----------------------------------------------------
 
-            ip = router["ip"]
-            vendor = router["vendor"]
+        result = wait_for_agent_result(
+            job_id,
+            timeout=900
+        )
 
-            print(
-                f"[DISCOVERY] Connecting to "
-                f"{ip} ({vendor})"
+        if not result:
+
+            raise RuntimeError(
+                "Empty Agent result"
             )
 
-            res = fetch_config_via_ssh_tunnel(
-                chan,
-                ip,
-                vendor,
-                username,
-                password
+        if not result.get(
+            "success",
+            False
+        ):
+
+            raise RuntimeError(
+                result.get(
+                    "error",
+                    "Agent discovery failed"
+                )
             )
 
-            if res and res.get("config"):
+        raw_devices = result.get(
+            "devices",
+            []
+        )
 
-                cfg_content = res["config"]
-                log_content = res["logs"]
+        if not isinstance(
+            raw_devices,
+            list
+        ):
 
-                hostname = res.get(
-                    "forced_hostname",
-                    "UNKNOWN"
+            raise RuntimeError(
+                "Invalid discovery result"
+            )
+
+        # ----------------------------------------------------
+        # Parse returned configurations
+        # ----------------------------------------------------
+
+        discovered = []
+
+        for item in raw_devices:
+
+            try:
+
+                ip = item.get(
+                    "ip"
                 )
 
-                if (
-                    hostname == "UNKNOWN"
-                    and (
-                        "hostname"
-                        in cfg_content.lower()
-                        or "sysname"
-                        in cfg_content.lower()
-                        or "set"
-                        in cfg_content.lower()
-                        or "config"
-                        in cfg_content.lower()
+                vendor = normalize_vendor(
+                    item.get(
+                        "vendor",
+                        "Unknown"
                     )
-                ):
+                )
 
-                    hostname = extract_hostname(
-                        cfg_content,
+                config = item.get(
+                    "config",
+                    ""
+                )
+
+                logs = item.get(
+                    "logs",
+                    ""
+                )
+
+                forced_hostname = item.get(
+                    "forced_hostname"
+                )
+
+                if not ip:
+                    continue
+
+                hostname = (
+                    forced_hostname
+                    or extract_hostname(
+                        config,
                         username
                     )
+                )
 
-                if hostname == "UNKNOWN":
+                version = extract_version(
+                    config
+                )
 
-                    hostname = (
-                        f"Router_"
-                        f"{ip.replace('.', '_')}"
+                loopback = extract_loopback(
+                    config
+                )
+
+                nsap = extract_nsap(
+                    config
+                )
+
+                isis_interfaces = (
+                    parse_isis_interfaces(
+                        config,
+                        vendor
                     )
+                )
 
                 device_data = {
 
-                    "hostname": hostname,
+                    "ip": ip,
 
                     "vendor": vendor,
 
-                    "version": extract_version(
-                        cfg_content
-                    ),
+                    "hostname": hostname,
 
-                    "loopback": extract_loopback(
-                        cfg_content
-                    ),
+                    "version": version,
 
-                    "nsap": extract_nsap(
-                        cfg_content
-                    ),
+                    "loopback": loopback,
+
+                    "nsap": nsap,
 
                     "isis_interfaces":
-                        parse_isis_interfaces(
-                            cfg_content,
-                            vendor
-                        ),
+                        isis_interfaces,
 
-                    "isis_logs":
-                        (
-                            log_content.strip()
-                            if log_content.strip()
-                            else
-                            "No recent ISIS logs "
-                            "found in buffer."
-                        )
+                    "isis_logs": logs,
+
+                    # Keep raw config
+                    # useful for debugging
+                    "config": config
                 }
 
-                # Remove old copy of same hostname
-                devices = [
-                    d
-                    for d in devices
-                    if d["hostname"] != hostname
-                ]
-
-                devices.append(device_data)
-
-                print(
-                    f"[DISCOVERY] SUCCESS: "
-                    f"{hostname} "
-                    f"({vendor})"
+                discovered.append(
+                    device_data
                 )
 
-            else:
-
                 print(
-                    f"[DISCOVERY] FAILED: "
-                    f"{ip} ({vendor})"
+                    f"[DISCOVERY] "
+                    f"{ip} -> "
+                    f"{hostname} -> "
+                    f"{vendor} -> "
+                    f"{loopback}"
                 )
 
-            time.sleep(2)
+            except Exception as e:
 
-        ssh.close()
+                print(
+                    f"[DISCOVERY] Parse error "
+                    f"for {item.get('ip')}: {e}"
+                )
+
+        # ----------------------------------------------------
+        # Build topology
+        # ----------------------------------------------------
+
+        links = build_links(
+            discovered
+        )
+
+        # Store links in every response cycle
+        # by keeping them as a global property
+        for device in discovered:
+
+            device.setdefault(
+                "links",
+                []
+            )
+
+        # ----------------------------------------------------
+        # Update global devices
+        # ----------------------------------------------------
+
+        with discovery_lock:
+
+            devices = discovered
+
+        print(
+            f"[DISCOVERY] Completed. "
+            f"Devices: {len(discovered)}, "
+            f"Links: {len(links)}"
+        )
+
+        discovery_finished = True
 
     except Exception as e:
 
-        print(
-            f"[DISCOVERY] Discovery error: {e}"
-        )
-
-    finally:
+        discovery_error = str(e)
 
         discovery_finished = True
 
         print(
-            "[DISCOVERY] Discovery process finished."
+            f"[DISCOVERY] ERROR: {e}"
         )
 
 
-# =====================================================
-# Helper: Vendor by Router IP
-# =====================================================
-
-def helper_get_vendor_by_ip(ip):
-
-    # =================================================
-    # First: already discovered device
-    # =================================================
-
-    for d in devices:
-
-        if d.get("loopback") == ip:
-
-            return d.get(
-                "vendor",
-                "XE"
-            )
-
-    # =================================================
-    # Second: cached router inventory
-    # =================================================
-
-    with router_inventory_lock:
-
-        current_inventory = list(
-            router_inventory
-        )
-
-    for router in current_inventory:
-
-        if router.get("ip") == ip:
-
-            return router.get(
-                "vendor",
-                "XE"
-            )
-
-    # =================================================
-    # Third: refresh database if cache is empty
-    # =================================================
-
-    if not current_inventory:
-
-        routers_list = load_router_inventory()
-
-        for router in routers_list:
-
-            if router.get("ip") == ip:
-
-                return router.get(
-                    "vendor",
-                    "XE"
-                )
-
-    return "XE"
-
-
-# =====================================================
-# Flask Routes
-# =====================================================
+# ============================================================
+# Root
+# ============================================================
 
 @app.route("/")
-def check_session():
+def index():
 
     return redirect(
-        url_for("login_page")
+        url_for("login")
     )
 
+
+# ============================================================
+# Login
+# ============================================================
 
 @app.route(
     "/login",
     methods=["GET", "POST"]
 )
-def login_page():
+def login():
 
-    if request.method == "POST":
+    if request.method == "GET":
 
-        username = request.form.get(
-            "username"
+        return render_template(
+            "login.html"
         )
 
-        password = request.form.get(
-            "password"
-        )
+    username = request.form.get(
+        "username",
+        ""
+    ).strip()
 
-        try:
-
-            # =================================================
-            # Validate firewall credentials
-            # =================================================
-
-            ssh_test = paramiko.SSHClient()
-
-            ssh_test.set_missing_host_key_policy(
-                paramiko.AutoAddPolicy()
-            )
-
-            ssh_test.connect(
-                FIREWALL_IP,
-                username=username,
-                password=password,
-                timeout=5
-            )
-
-            ssh_test.close()
-
-            # =================================================
-            # Store session
-            # =================================================
-
-            session["ssh_user"] = username
-            session["ssh_pass"] = password
-
-            # =================================================
-            # Start discovery
-            #
-            # Router DB:
-            # Google Sheet -> routers.json fallback
-            # =================================================
-
-            t = threading.Thread(
-                target=network_discovery_worker,
-                args=(
-                    username,
-                    password
-                )
-            )
-
-            t.daemon = True
-            t.start()
-
-            return render_template(
-                "index.html"
-            )
-
-        except Exception as e:
-
-            print(
-                f"[LOGIN] Login failed: {e}"
-            )
-
-            return render_template(
-                "login.html",
-                error="Login failed. Access Denied."
-            )
-
-    return render_template(
-        "login.html"
+    password = request.form.get(
+        "password",
+        ""
     )
 
+    if not username or not password:
 
-@app.route("/topology")
-def topology():
+        return render_template(
+            "login.html",
+            error="Username and password are required."
+        )
 
-    return jsonify(
+    # --------------------------------------------------------
+    # Check Agent
+    # --------------------------------------------------------
+
+    with agent_lock:
+
+        last_seen = agent_status.get(
+            "last_seen",
+            0
+        )
+
+        agent_online = (
+            agent_status.get(
+                "online",
+                False
+            )
+            and
+            time.time() - last_seen <= 15
+        )
+
+    if not agent_online:
+
+        return render_template(
+            "login.html",
+            error=(
+                "Network Agent is offline. "
+                "Start agent.py on the device connected "
+                "to FortiClient VPN."
+            )
+        )
+
+    # --------------------------------------------------------
+    # Send SSH Test to Agent
+    # --------------------------------------------------------
+
+    job_id = create_agent_job(
+        "test_ssh",
         {
-            "nodes": devices,
-            "links": build_links(devices),
-            "finished": discovery_finished
+            "firewall_ip": FIREWALL_IP,
+            "username": username,
+            "password": password
         }
     )
 
+    result = wait_for_agent_result(
+        job_id,
+        timeout=30
+    )
 
-# =====================================================
-# Optional Router Database Status
-# =====================================================
+    if not result:
 
-@app.route("/router_database")
+        return render_template(
+            "login.html",
+            error="No response from Network Agent."
+        )
+
+    if not result.get(
+        "success",
+        False
+    ):
+
+        return render_template(
+            "login.html",
+            error=result.get(
+                "error",
+                "SSH authentication failed."
+            )
+        )
+
+    # --------------------------------------------------------
+    # Store Session
+    #
+    # TEMPORARY design:
+    # Password is stored in Flask session.
+    #
+    # Later we should replace this with a short-lived
+    # server-side credential/session mechanism.
+    # --------------------------------------------------------
+
+    session["ssh_user"] = username
+
+    session["ssh_pass"] = password
+
+    session["logged_in"] = True
+
+    # --------------------------------------------------------
+    # Start Discovery
+    # --------------------------------------------------------
+
+    discovery_thread = threading.Thread(
+        target=network_discovery_worker,
+        args=(
+            username,
+            password
+        ),
+        daemon=True
+    )
+
+    discovery_thread.start()
+
+    return redirect(
+        url_for("topology")
+    )
+
+
+# ============================================================
+# Topology
+# ============================================================
+
+@app.route(
+    "/topology"
+)
+def topology():
+
+    if not session.get(
+        "logged_in",
+        False
+    ):
+
+        return redirect(
+            url_for("login")
+        )
+
+    return render_template(
+        "index.html"
+    )
+
+
+# ============================================================
+# Topology API
+# ============================================================
+
+@app.route(
+    "/api/topology"
+)
+@app.route(
+    "/topology/data"
+)
+def topology_data():
+
+    links = build_links(
+        devices
+    )
+
+    nodes = []
+
+    for device in devices:
+
+        node_id = (
+            device.get("loopback")
+            or device.get("ip")
+            or device.get("hostname")
+        )
+
+        nodes.append({
+
+            "id": node_id,
+
+            "ip": device.get(
+                "ip"
+            ),
+
+            "hostname": device.get(
+                "hostname"
+            ),
+
+            "vendor": device.get(
+                "vendor"
+            ),
+
+            "version": device.get(
+                "version"
+            ),
+
+            "loopback": device.get(
+                "loopback"
+            ),
+
+            "nsap": device.get(
+                "nsap"
+            ),
+
+            "isis_interfaces":
+                device.get(
+                    "isis_interfaces",
+                    []
+                )
+        })
+
+    return jsonify({
+
+        "nodes": nodes,
+
+        "links": links,
+
+        "finished":
+            discovery_finished,
+
+        "error":
+            discovery_error
+    })
+
+
+# ============================================================
+# Router Database
+# ============================================================
+
+@app.route(
+    "/router_database"
+)
 def router_database():
+
+    if not session.get(
+        "logged_in",
+        False
+    ):
+
+        return redirect(
+            url_for("login")
+        )
 
     with router_inventory_lock:
 
-        current_inventory = list(
+        data = list(
             router_inventory
         )
 
     return jsonify(
-        {
-            "count": len(current_inventory),
-            "routers": current_inventory
-        }
+        data
     )
 
 
-# =====================================================
-# Stateful Telnet Engine
-# =====================================================
+# ============================================================
+# Helper:
+# Find Vendor by Router IP
+# ============================================================
 
-def get_or_create_router_channel(
-    router_ip,
-    username,
-    password,
-    vendor
-):
+def helper_get_vendor_by_ip(ip):
 
-    session_key = (
-        f"{username}_{router_ip}"
-    )
+    # --------------------------------------------------------
+    # First discovered devices
+    # --------------------------------------------------------
 
-    # =================================================
-    # Existing session
-    # =================================================
+    for device in devices:
 
-    if session_key in live_sessions:
+        if device.get(
+            "ip"
+        ) == ip:
 
-        ssh, chan = live_sessions[
-            session_key
-        ]
+            return normalize_vendor(
+                device.get(
+                    "vendor"
+                )
+            )
 
-        if (
-            chan.get_transport()
-            and chan.get_transport().is_active()
-        ):
+        if device.get(
+            "loopback"
+        ) == ip:
 
-            return chan
+            return normalize_vendor(
+                device.get(
+                    "vendor"
+                )
+            )
 
-    # =================================================
-    # New firewall SSH session
-    # =================================================
+    # --------------------------------------------------------
+    # Router Inventory
+    # --------------------------------------------------------
 
-    ssh = paramiko.SSHClient()
+    with router_inventory_lock:
 
-    ssh.set_missing_host_key_policy(
-        paramiko.AutoAddPolicy()
-    )
-
-    ssh.connect(
-        FIREWALL_IP,
-        username=username,
-        password=password,
-        timeout=5
-    )
-
-    chan = ssh.invoke_shell()
-
-    time.sleep(0.5)
-
-    if chan.recv_ready():
-        chan.recv(65535)
-
-    # =================================================
-    # Telnet to router
-    # =================================================
-
-    chan.send(
-        f"telnet {router_ip}\n"
-    )
-
-    time.sleep(1)
-
-    output_gate = ""
-
-    if chan.recv_ready():
-
-        output_gate = chan.recv(
-            65535
-        ).decode(
-            "utf-8",
-            errors="ignore"
+        inventory = list(
+            router_inventory
         )
 
-    if re.search(
-        r"[Uu]sername:|[L|l]ogin:",
-        output_gate
+    for router in inventory:
+
+        if router.get(
+            "ip"
+        ) == ip:
+
+            return normalize_vendor(
+                router.get(
+                    "vendor"
+                )
+            )
+
+    # --------------------------------------------------------
+    # Reload inventory
+    # --------------------------------------------------------
+
+    inventory = load_router_inventory()
+
+    for router in inventory:
+
+        if router.get(
+            "ip"
+        ) == ip:
+
+            return normalize_vendor(
+                router.get(
+                    "vendor"
+                )
+            )
+
+    return "Unknown"
+
+
+# ============================================================
+# Telnet Page
+# ============================================================
+
+@app.route(
+    "/telnet"
+)
+def telnet():
+
+    if not session.get(
+        "logged_in",
+        False
     ):
 
-        chan.send(
-            f"{username}\n"
+        return redirect(
+            url_for("login")
         )
-
-        time.sleep(0.5)
-
-        chan.send(
-            f"{password}\n"
-        )
-
-        time.sleep(1)
-
-    elif "password:" in output_gate.lower():
-
-        chan.send(
-            f"{password}\n"
-        )
-
-        time.sleep(1)
-
-    # =================================================
-    # Terminal settings
-    # =================================================
-
-    if vendor in ["XE", "XR"]:
-
-        chan.send(
-            "terminal length 0\n"
-        )
-
-        time.sleep(0.3)
-
-    elif vendor == "Huawei":
-
-        chan.send(
-            "screen-length 0 temporary\n"
-        )
-
-        time.sleep(0.3)
-
-    if chan.recv_ready():
-        chan.recv(65535)
-
-    live_sessions[
-        session_key
-    ] = (
-        ssh,
-        chan
-    )
-
-    return chan
-
-
-# =====================================================
-# Telnet Page
-# =====================================================
-
-@app.route("/telnet")
-def telnet_page():
-
-    hostname = request.args.get(
-        "hostname",
-        "Unknown-Router"
-    )
-
-    ip = request.args.get(
-        "ip",
-        "127.0.0.1"
-    )
-
-    vendor = helper_get_vendor_by_ip(
-        ip
-    )
-
-    welcome_banner = (
-
-        "Microsoft Windows "
-        "[Version 10.0.19045.6466]\n"
-
-        "(c) Microsoft Corporation. "
-        "All rights reserved.\n\n"
-
-        f"C:\\Users\\CompuMisr>"
-        f"ssh {session.get('ssh_user')}"
-        f"@{FIREWALL_IP}\n"
-
-        "Linux Kerberos-Slave "
-        "Terminal Active...\n"
-
-        f"{session.get('ssh_user')}"
-        f"@Kerberos-Slave:~$ "
-        f"telnet {ip}\n"
-
-        f"Trying {ip}...\n"
-
-        f"Connected to {ip}.\n"
-
-        "Escape character is '^]'.\n"
-    )
 
     return render_template(
-        "telnet.html",
-        hostname=hostname,
-        ip=ip,
-        vendor=vendor,
-        initial_banner=welcome_banner.replace(
-            "\n",
-            "<br>"
-        )
+        "telnet.html"
     )
 
 
-# =====================================================
-# Execute Telnet Command
-# =====================================================
+# ============================================================
+# Execute Router Command
+# ============================================================
 
 @app.route(
     "/execute_command",
     methods=["POST"]
 )
 def execute_command():
+
+    if not session.get(
+        "logged_in",
+        False
+    ):
+
+        return jsonify({
+            "success": False,
+            "error": "Not authenticated"
+        }), 401
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    router_ip = str(
+        data.get(
+            "ip",
+            ""
+        )
+    ).strip()
+
+    command = str(
+        data.get(
+            "command",
+            ""
+        )
+    )
+
+    is_break = bool(
+        data.get(
+            "is_break",
+            False
+        )
+    )
+
+    if not router_ip:
+
+        return jsonify({
+            "success": False,
+            "error": "Missing router IP"
+        }), 400
 
     username = session.get(
         "ssh_user"
@@ -1782,306 +1822,355 @@ def execute_command():
         "ssh_pass"
     )
 
-    if not username or not password:
+    if not username or password is None:
 
-        return jsonify(
-            {
-                "output":
-                    "\n"
-                    "<span style='color:red;'>"
-                    "[Session Expired]"
-                    "</span>\n"
-            }
-        )
-
-    data = request.json
-
-    router_ip = data.get(
-        "ip"
-    )
-
-    command = data.get(
-        "command",
-        ""
-    )
-
-    is_break_action = data.get(
-        "is_break",
-        False
-    )
+        return jsonify({
+            "success": False,
+            "error": "Session credentials missing"
+        }), 401
 
     vendor = helper_get_vendor_by_ip(
         router_ip
     )
 
-    try:
+    # --------------------------------------------------------
+    # Send command to Agent
+    # --------------------------------------------------------
 
-        chan = get_or_create_router_channel(
-            router_ip,
-            username,
-            password,
-            vendor
-        )
+    job_id = create_agent_job(
+        "router_command",
+        {
 
-        # =================================================
-        # Break / More
-        # =================================================
+            "firewall_ip":
+                FIREWALL_IP,
 
-        if is_break_action:
+            "router_ip":
+                router_ip,
 
-            chan.send("q")
+            "username":
+                username,
 
-            chan.send("\x03")
+            "password":
+                password,
 
-            time.sleep(0.5)
+            "vendor":
+                vendor,
 
-        else:
+            "command":
+                command,
 
-            if command != " ":
+            "is_break":
+                is_break
+        }
+    )
 
-                chan.send(
-                    f"{command}\n"
-                )
+    # --------------------------------------------------------
+    # Wait for Agent
+    # --------------------------------------------------------
 
-            else:
+    result = wait_for_agent_result(
+        job_id,
+        timeout=60
+    )
 
-                chan.send(" ")
+    if not result:
 
-            if (
-                vendor == "Juniper"
-                and (
-                    "show"
-                    in command.lower()
-                    or command == " "
-                )
-            ):
+        return jsonify({
+            "success": False,
+            "error": "Agent timeout"
+        }), 504
 
-                time.sleep(1.2)
+    if not result.get(
+        "success",
+        False
+    ):
 
-            else:
+        return jsonify({
+            "success": False,
+            "error": result.get(
+                "error",
+                "Router command failed"
+            )
+        }), 500
 
-                time.sleep(0.5)
+    # --------------------------------------------------------
+    # Raw output from Agent
+    # --------------------------------------------------------
 
-        # =================================================
-        # Collect output
-        # =================================================
-
-        raw_output = ""
-
-        start_wait = time.time()
-
-        max_idle = (
-            1.0
-            if vendor == "Juniper"
-            else 0.3
-        )
-
-        while True:
-
-            if chan.recv_ready():
-
-                raw_output += chan.recv(
-                    65535
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
-                )
-
-                start_wait = time.time()
-
-            else:
-
-                time.sleep(0.05)
-
-                if (
-                    time.time() - start_wait
-                    > max_idle
-                ):
-                    break
-
-        # =================================================
-        # Clean output
-        # =================================================
-
-        clean_output = raw_output.replace(
-            f"telnet {router_ip}\n",
+    output = str(
+        result.get(
+            "output",
             ""
         )
+    )
 
-        clean_output = re.sub(
-            r".\x08+",
-            "",
-            clean_output
+    # --------------------------------------------------------
+    # Clean output
+    # --------------------------------------------------------
+
+    output = output.replace(
+        "\x08",
+        ""
+    )
+
+    output = output.replace(
+        "\r",
+        ""
+    )
+
+    output = re.sub(
+        r"--More--",
+        "",
+        output,
+        flags=re.IGNORECASE
+    )
+
+    # --------------------------------------------------------
+    # Detect More
+    # --------------------------------------------------------
+
+    is_more = bool(
+        re.search(
+            r"--More--",
+            output,
+            re.IGNORECASE
+        )
+    )
+
+    # --------------------------------------------------------
+    # Detect hostname from prompt
+    # --------------------------------------------------------
+
+    prompt_hostname = None
+
+    prompt_patterns = [
+
+        r"(?m)^([A-Za-z0-9_.\-]+)[>#]\s*$",
+
+        r"(?m)^([A-Za-z0-9_.\-]+)\([^)]*\)[>#]\s*$",
+
+        r"(?m)^<([^>]+)>\s*$",
+
+    ]
+
+    for pattern in prompt_patterns:
+
+        matches = re.findall(
+            pattern,
+            output
         )
 
-        clean_output = clean_output.replace(
-            "\x08",
-            ""
-        )
+        if matches:
 
-        lines = clean_output.splitlines()
-
-        main_body = (
-            "<br>".join(lines[:-1])
-            if len(lines) > 1
-            else clean_output
-        )
-
-        last_line = (
-            lines[-1]
-            if lines
-            else ""
-        )
-
-        # =================================================
-        # More detection
-        # =================================================
-
-        is_waiting_more = bool(
-            re.search(
-                r"---.*more.*---|more",
-                last_line,
-                re.IGNORECASE
-            )
-        )
-
-        # =================================================
-        # Prompt hostname
-        # =================================================
-
-        clean_hostname = last_line.strip()
-
-        for char in [
-            "#",
-            ">",
-            "<",
-            "$",
-            "@",
-            " "
-        ]:
-
-            clean_hostname = (
-                clean_hostname.replace(
-                    char,
-                    ""
-                )
-            )
-
-        if (
-            "master"
-            in clean_hostname.lower()
-        ):
-
-            clean_hostname = (
-                clean_hostname.lower()
-                .replace(
-                    "{master}",
-                    ""
-                )
-                .strip()
+            prompt_hostname = (
+                matches[-1]
             )
 
-        if (
-            not clean_hostname
-            or is_waiting_more
-        ):
+            break
 
-            clean_hostname = "Router"
+    # --------------------------------------------------------
+    # Vendor prompt
+    # --------------------------------------------------------
 
-        # =================================================
-        # Build prompt
-        # =================================================
+    if not prompt_hostname:
 
-        if is_waiting_more:
+        prompt_hostname = router_ip
 
-            custom_prompt = (
-                "<span style='color: "
-                "#00ffaa; "
-                "background: #222; "
-                "padding: 2px 5px; "
-                "font-weight: bold;'>"
-                "-- More "
-                "(Space: Page, Enter: Line, "
-                "Any Key: Exit) --"
-                "</span>"
+    prompt_html = ""
+
+    if vendor == "XE":
+
+        prompt_html = (
+            f"<span class='prompt'>"
+            f"{prompt_hostname}# "
+            f"</span>"
+        )
+
+    elif vendor == "XR":
+
+        prompt_html = (
+            f"<span class='prompt'>"
+            f"{prompt_hostname}# "
+            f"</span>"
+        )
+
+    elif vendor == "Juniper":
+
+        prompt_html = (
+            f"<span class='prompt'>"
+            f"{prompt_hostname}@router&gt; "
+            f"</span>"
+        )
+
+    elif vendor == "Huawei":
+
+        prompt_html = (
+            f"<span class='prompt'>"
+            f"&lt;{prompt_hostname}&gt; "
+            f"</span>"
+        )
+
+    elif vendor == "Forti":
+
+        prompt_html = (
+            f"<span class='prompt'>"
+            f"{prompt_hostname} # "
+            f"</span>"
+        )
+
+    else:
+
+        prompt_html = (
+            f"<span class='prompt'>"
+            f"{prompt_hostname}&gt; "
+            f"</span>"
+        )
+
+    # --------------------------------------------------------
+    # Return
+    # --------------------------------------------------------
+
+    return jsonify({
+
+        "success": True,
+
+        "output": output,
+
+        "is_more": is_more,
+
+        "vendor": vendor,
+
+        "hostname":
+            prompt_hostname,
+
+        "prompt_html":
+            prompt_html
+    })
+
+
+# ============================================================
+# Logout
+# ============================================================
+
+@app.route(
+    "/logout"
+)
+def logout():
+
+    session.clear()
+
+    return redirect(
+        url_for("login")
+    )
+
+
+# ============================================================
+# Health Check
+# ============================================================
+
+@app.route(
+    "/health"
+)
+def health():
+
+    with agent_lock:
+
+        status = dict(
+            agent_status
+        )
+
+    online = (
+        status.get(
+            "online",
+            False
+        )
+        and
+        time.time()
+        - status.get(
+            "last_seen",
+            0
+        )
+        <= 15
+    )
+
+    return jsonify({
+
+        "server": "online",
+
+        "agent": (
+            "online"
+            if online
+            else "offline"
+        ),
+
+        "agent_id":
+            status.get(
+                "agent_id"
+            ),
+
+        "agent_hostname":
+            status.get(
+                "hostname"
+            ),
+
+        "last_seen":
+            status.get(
+                "last_seen"
             )
-
-        else:
-
-            if vendor == "Juniper":
-
-                custom_prompt = (
-                    "{master}<br>"
-                    "<span style='color: "
-                    "#00ffaa;'>"
-                    f"{username}@"
-                    f"{clean_hostname}"
-                    "</span>&gt; "
-                )
-
-            elif vendor == "Huawei":
-
-                custom_prompt = (
-                    "&lt;"
-                    "<span style='color: "
-                    "#00ffaa;'>"
-                    f"{clean_hostname}"
-                    "</span>&gt; "
-                )
-
-            elif vendor == "Forti":
-
-                custom_prompt = (
-                    "<span style='color: "
-                    "#00ffaa;'>"
-                    f"{clean_hostname}"
-                    "</span> $ "
-                )
-
-            else:
-
-                custom_prompt = (
-                    "<span style='color: "
-                    "#00ffaa;'>"
-                    f"{clean_hostname}"
-                    "</span># "
-                )
-
-        return jsonify(
-            {
-                "output":
-                    f"{main_body}"
-                    f"<br>"
-                    f"{custom_prompt}",
-
-                "is_more":
-                    is_waiting_more
-            }
-        )
-
-    except Exception as e:
-
-        return jsonify(
-            {
-                "output":
-                    "\n"
-                    "<span style='color:#ff4444;'>"
-                    "[Session Tunnel Error: "
-                    f"{str(e)}"
-                    "]"
-                    "</span>\n"
-            }
-        )
+    })
 
 
-# =====================================================
-# Start Flask
-# =====================================================
+# ============================================================
+# Load Router Inventory on Startup
+# ============================================================
+
+try:
+
+    load_router_inventory()
+
+except Exception as e:
+
+    print(
+        f"[STARTUP] Router inventory error: {e}"
+    )
+
+
+# ============================================================
+# Main
+# ============================================================
 
 if __name__ == "__main__":
 
+    print("=" * 60)
+
+    print(
+        "NOOR NETWORK TOPOLOGY SERVER"
+    )
+
+    print("=" * 60)
+
+    print(
+        f"Firewall IP: {FIREWALL_IP}"
+    )
+
+    print(
+        "Agent architecture: ENABLED"
+    )
+
+    print(
+        "Listening on: 0.0.0.0:5000"
+    )
+
+    print("=" * 60)
+
     app.run(
-        debug=True,
         host="0.0.0.0",
-        port=5000
+        port=int(
+            os.getenv(
+                "PORT",
+                "5000"
+            )
+        ),
+        debug=False,
+        threaded=True
     )
