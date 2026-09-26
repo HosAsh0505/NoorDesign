@@ -12,7 +12,7 @@ import paramiko
 
 SERVER_URL = os.getenv(
     "NOOR_SERVER_URL",
-    "https://YOUR-APP.onrender.com"
+    "https://upgraded-adventure-6v5ww9rqj5wqcx4jj-5000.app.github.dev/login"
 ).rstrip("/")
 
 AGENT_TOKEN = os.getenv(
