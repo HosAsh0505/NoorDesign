@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ISIS Topology - Login</title>
+    <style>
+        body { background:#1e1e1e; color:white; font-family:Arial; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-container { background: #222; padding: 30px; border-radius: 15px; border: 2px solid #00ffff; box-shadow: 0 0 15px rgba(0,255,255,0.3); width: 320px; }
+        h2 { text-align: center; color: #00ffff; margin-top: 0; }
+        input[type="text"], input[type="password"] { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #444; background: #333; color: white; border-radius: 5px; box-sizing: border-box; }
+        button { width: 100%; padding: 10px; background: #00ffff; color: #1e1e1e; border: none; font-weight: bold; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #00cccc; }
+        .error { color: #ff5555; text-align: center; margin-top: 15px; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+<div class="login-container">
+    <h2>Gate Authentication</h2>
+    <form action="/login" method="POST">
+        <label>Username</label>
+        <input type="text" name="username" placeholder="Enter USR" required>
+        
+        <label>Password</label>
+        <input type="password" name="password" placeholder="Enter PW" required>
+        
+        <button type="submit">Connect to Gate</button>
+    </form>
+    
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+</div>
+
+</body>
+</html>

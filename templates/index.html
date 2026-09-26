@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ISIS Topology Engine</title>
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <style>
+        html, body { 
+            background:#1e1e1e; color:white; font-family:Arial, sans-serif; margin: 0; padding: 15px; height: 100vh; box-sizing: border-box; display: flex; flex-direction: column; overflow: hidden; 
+        }
+        h2 { margin: 0 0 10px 0; font-size: 22px; flex-shrink: 0; }
+        .controls-bar { background: #222; padding: 10px 15px; border-radius: 8px; margin-bottom: 10px; border: 1px solid #444; display: flex; gap: 15px; align-items: center; justify-content: space-between; flex-shrink: 0; }
+        .search-box { display: flex; gap: 10px; flex-grow: 1; max-width: 500px; }
+        .search-box input { background: #111; border: 1px solid #555; color: white; padding: 8px 12px; border-radius: 5px; width: 100%; font-size: 14px; }
+        .search-box input:focus { border-color: #00ffff; outline: none; }
+        
+        .btn { background: #00ffff; color: #111; border: none; padding: 8px 16px; border-radius: 5px; font-weight: bold; cursor: pointer; font-size: 14px; transition: all 0.3s ease; }
+        .btn:hover { background: #00cccc; transform: scale(1.02); }
+        .btn-reset { background: #ff4444; color: white; }
+        .btn-reset:hover { background: #cc3333; }
+        .btn-telnet { background: #00ff00; color: #111; float: right; margin-top: 15px; }
+        .btn-telnet:hover { background: #00cc00; }
+        .btn-ok { float: right; background: #555; color: white; padding: 6px 12px; font-size: 12px; border-radius: 4px; }
+        .btn-ok:hover { background: #444; }
+
+        #network { flex-grow: 1; border: 1px solid #444; background: #111; border-radius: 10px; min-height: 0; }
+
+        .dashboard { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 10px; flex-shrink: 0; }
+        .card { background: #222; padding: 10px; border-radius: 8px; border: 1px solid #444; text-align: center; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        .card h3 { margin: 0 0 3px 0; font-size: 11px; color: #aaa; text-transform: uppercase; }
+        .card p { margin: 0; font-size: 20px; font-weight: bold; color: #00ffff; }
+        .card.total { border-left: 4px solid #00ffff; }
+        .card.links { border-left: 4px solid #ffaa00; }
+        .card.vendors { border-left: 4px solid #00ff00; font-size: 10px; }
+        .card.vendors p { font-size: 14px; color: #fff; }
+    </style>
+</head>
+<body>
+
+<h2>ISIS Topology Engine Dashboard</h2>
+
+<div class="controls-bar">
+    <div class="search-box">
+        <input type="text" id="searchInput" placeholder="Search by Hostname or Loopback IP..." oninput="searchTopology()">
+    </div>
+    <button class="btn btn-reset" onclick="resetLayout()">🔄 Reset Layout</button>
+</div>
+
+<div id="popup" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:650px; max-height:550px; background:#222; color:white; border:2px solid #00ffff; padding:20px; overflow:auto; z-index:9999; font-family:Consolas; border-radius: 20px; box-shadow: 0 0 20px rgba(0,255,255,0.2);">
+    <button class="btn btn-ok" onclick="document.getElementById('popup').style.display='none'">OK</button>
+    <h3 style="margin-top: 0; color: #00ffff;">Device Information</h3>
+    <hr style="border: 0; border-top: 1px solid #444; margin-bottom: 15px;">
+    
+    <pre id="popupContent" style="white-space: pre-wrap; font-family: Consolas; margin: 0;"></pre>
+    
+    <button id="telnetBtn" class="btn btn-telnet">⚡ Open Telnet Session</button>
+</div>
+
+<div id="network"></div>
+
+<div class="dashboard">
+    <div class="card total">
+        <h3>Total Routers</h3>
+        <p id="statTotalNodes">0</p>
+    </div>
+    <div class="card links">
+        <h3>ISIS Links</h3>
+        <p id="statTotalLinks">0</p>
+    </div>
+    <div class="card vendors">
+        <h3>Cisco XR / XE</h3>
+        <p id="statCisco">0 / 0</p>
+    </div>
+    <div class="card vendors">
+        <h3>Juniper / Huawei</h3>
+        <p id="statJunHua">0 / 0</p>
+    </div>
+    <div class="card vendors">
+        <h3>Forti / Unknown</h3>
+        <p id="statFortiUnk">0 / 0</p>
+    </div>
+</div>
+
+<script>
+const ICONS = {
+    "XR":"https://img.icons8.com/color/96/router.png",
+    "XE":"https://img.icons8.com/fluency/96/router.png",
+    "Juniper":"https://img.icons8.com/ios-filled/100/router.png",
+    "Huawei":"https://img.icons8.com/3d-fluency/94/wifi-router.png",
+    "Forti":"https://img.icons8.com/color/96/firewall.png",
+    "Unknown":"https://img.icons8.com/color/96/help.png"
+};
+
+let nodes = new vis.DataSet([]);
+let edges = new vis.DataSet([]);
+let network = null;
+let globalData = null;
+let edgeMeta = {};
+let refreshInterval;
+
+function initNetwork() {
+    const container = document.getElementById("network");
+    const data = { nodes: nodes, edges: edges };
+    
+    const options = {
+        physics: { 
+            enabled: true, 
+            stabilization: { iterations: 150 },
+            solver: "forceAtlas2Based",
+            forceAtlas2Based: { gravitationalConstant: -150, centralGravity: 0.01, springLength: 140, springConstant: 0.05, damping: 0.4 }
+        },
+        interaction: { dragNodes: true, dragView: true, zoomView: true, hover: true },
+        edges: { smooth: false }
+    };
+    network = new vis.Network(container, data, options);
+
+    network.on("dragStart", function (params) {
+        if (params.nodes.length > 0) { nodes.update({ id: params.nodes[0], fixed: false }); }
+    });
+    network.on("dragEnd", function (params) {
+        if (params.nodes.length > 0) { nodes.update({ id: params.nodes[0], fixed: true }); }
+    });
+
+    network.on("doubleClick", function(params){
+        if (params.nodes.length > 0) {
+            let nodeId = params.nodes[0];
+            let node = nodes.get(nodeId);
+            let device = globalData.nodes.find(d => d.hostname === node.label);
+            if(!device) return;
+            
+            let msg = "Hostname: " + device.hostname + "\n" + 
+                      "Vendor: " + device.vendor + "\n" + 
+                      "Version: " + device.version + "\n" + 
+                      "Loopback: " + device.loopback + "\n" + 
+                      "NSAP: " + device.nsap + "\n\n" + 
+                      "ISIS Interfaces:\n" + device.isis_interfaces.map(i => i.name + " - " + i.ip).join("\n");
+            
+            // 🚀 [عرض الـ Logs داخل الـ Popup]
+            msg += "\n\n==================================================\n";
+            msg += "📋 RECENT ISIS LOGS (Background Miner):\n";
+            msg += "==================================================\n";
+            msg += device.isis_logs ? device.isis_logs : "No logs collected yet.";
+            
+            document.getElementById("popupContent").textContent = msg;
+            
+            document.getElementById("telnetBtn").style.display = "block"; 
+            document.getElementById("telnetBtn").onclick = function() {
+                let targetIp = device.loopback ? device.loopback.trim() : "127.0.0.1";
+                window.open(`/telnet?hostname=${device.hostname}&ip=${targetIp}`, '_blank');
+            };
+
+            document.getElementById("popup").style.display = "block";
+            return;
+        }
+
+        if (params.edges.length > 0) {
+            let edgeId = params.edges[0];
+            let meta = edgeMeta[edgeId];
+            if (!meta) return;
+
+            let msg = `LINK DETAILS:\n\n`;
+            for (let c of meta.connections){
+                msg += `Network : ${c.network}\n\n${meta.from}\n${c.interfaceA}\n\n${meta.to}\n${c.interfaceB}\n\n----------------------------------------------------\n\n`;
+            }
+            document.getElementById("popupContent").textContent = msg;
+            document.getElementById("telnetBtn").style.display = "none"; 
+            document.getElementById("popup").style.display = "block";
+        }
+    });
+}
+
+function searchTopology() {
+    let query = document.getElementById("searchInput").value.trim().toLowerCase();
+    let allNodes = nodes.get();
+    if (query === "") {
+        allNodes.forEach(n => { nodes.update({ id: n.id, font: { color: "#00ffff", background: "rgba(0,0,0,0)" } }); });
+        network.fit({ animation: { duration: 500 } }); 
+        return;
+    }
+    allNodes.forEach(n => {
+        let device = globalData.nodes.find(d => d.hostname === n.label);
+        let hostname = n.label.toLowerCase();
+        let loopback = (device && device.loopback) ? device.loopback.toLowerCase() : "";
+        if (hostname.includes(query) || loopback.includes(query)) {
+            nodes.update({ id: n.id, font: { color: "#fff", background: "#ff00ff" } });
+        } else {
+            nodes.update({ id: n.id, font: { color: "#444", background: "rgba(0,0,0,0)" } });
+        }
+    });
+}
+
+function resetLayout() {
+    nodes.clear(); edges.clear(); globalData = null;
+    network.setOptions({ physics: { enabled: true } });
+    updateTopology();
+    document.getElementById("searchInput").value = "";
+}
+
+function updateDashboard(data) {
+    document.getElementById("statTotalNodes").textContent = data.nodes.length;
+    document.getElementById("statTotalLinks").textContent = data.links.length;
+    let xr = 0, xe = 0, jun = 0, hua = 0, forti = 0, unk = 0;
+    data.nodes.forEach(d => {
+        if(d.vendor === "XR") xr++; else if(d.vendor === "XE") xe++; else if(d.vendor === "Juniper") jun++; else if(d.vendor === "Huawei") hua++; else if(d.vendor === "Forti") forti++; else unk++;
+    });
+    document.getElementById("statCisco").textContent = `${xr} / ${xe}`;
+    document.getElementById("statJunHua").textContent = `${jun} / ${hua}`;
+    document.getElementById("statFortiUnk").textContent = `${forti} / ${unk}`;
+}
+
+async function updateTopology(){
+    try {
+        let res = await fetch("/topology");
+        let data = await res.json();
+        if (data.finished) { clearInterval(refreshInterval); }
+        if (globalData && JSON.stringify(globalData) === JSON.stringify(data)) { return; }
+        globalData = data;
+        updateDashboard(data);
+        let currentNodesInVis = nodes.getIds();
+        let newHostnameMap = {};
+        let currentMaxId = currentNodesInVis.length > 0 ? Math.max(...currentNodesInVis) : 0;
+
+        data.nodes.forEach(d => {
+            let existingNode = nodes.get({ filter: function (item) { return item.label === d.hostname; } })[0];
+            let nodeId = existingNode ? existingNode.id : ++currentMaxId;
+            if (!existingNode) {
+                let nodeConfig = { id: nodeId, label: d.hostname, shape: "image", image: ICONS[d.vendor] || ICONS["Unknown"], font: { color: "#00ffff", size: 18, strokeWidth: 6, strokeColor: "#000" }, shadow: { enabled: true, color: "rgba(0,255,255,0.4)", size: 12 }, size: 35 };
+                let currentIp = d.loopback ? d.loopback.trim() : "";
+                if (currentIp === "217.139.253.242") { nodeConfig.x = 0; nodeConfig.y = 0; nodeConfig.fixed = true; } 
+                else if (currentIp === "217.139.253.104") { nodeConfig.x = -450; nodeConfig.y = -250; nodeConfig.fixed = true; } 
+                else if (currentIp === "217.139.253.224") { nodeConfig.x = 450; nodeConfig.y = -250; nodeConfig.fixed = true; } 
+                else if (currentIp === "217.139.253.152") { nodeConfig.x = -550; nodeConfig.y = 300; nodeConfig.fixed = true; } 
+                else if (currentIp === "217.139.253.4") { nodeConfig.x = -400; nodeConfig.y = 300; nodeConfig.fixed = true; } 
+                else if (currentIp === "217.139.253.5") { nodeConfig.x = -250; nodeConfig.y = 300; nodeConfig.fixed = true; }
+                nodes.add(nodeConfig);
+            }
+            newHostnameMap[d.hostname] = nodeId;
+        });
+
+        data.links.forEach(l => {
+            let edgeId = l.from + "-" + l.to;
+            edgeMeta[edgeId] = { from: l.from, to: l.to, connections: l.connections };
+            if(newHostnameMap[l.from] && newHostnameMap[l.to] && !edges.get(edgeId)) {
+                edges.add({ id: edgeId, from: newHostnameMap[l.from], to: newHostnameMap[l.to], smooth: false, width: 2, color: { color: "#aaa", highlight: "#00ffff", hover: "#00ffff" } });
+            }
+        });
+    } catch (error) { console.error("Error updating topology:", error); }
+}
+
+window.onload = function() { initNetwork(); updateTopology(); refreshInterval = setInterval(updateTopology, 5000); };
+</script>
+</body>
+</html>

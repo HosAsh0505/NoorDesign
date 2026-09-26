@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ar">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SecureCRT Web-Console - {{ hostname }}</title>
+    <style>
+        body {
+            background-color: #0c0c0c;
+            color: #cccccc;
+            font-family: 'Consolas', 'Courier New', Courier, monospace;
+            margin: 0;
+            padding: 20px;
+            direction: ltr;
+        }
+        .terminal-container {
+            background-color: #1e1e1e;
+            border: 1px solid #333333;
+            border-radius: 6px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+            max-width: 1000px;
+            margin: 0 auto;
+            overflow: hidden;
+        }
+        .terminal-header {
+            background-color: #2d2d2d;
+            padding: 10px 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #3c3c3c;
+        }
+        .terminal-title { font-size: 13px; color: #aaaaaa; font-weight: bold; }
+        .window-buttons { display: flex; gap: 8px; }
+        .dot { width: 12px; height: 12px; border-radius: 50%; }
+        .dot-red { background-color: #ff5f56; }
+        .dot-yellow { background-color: #ffbd2e; }
+        .dot-green { background-color: #27c93f; }
+
+        .terminal-body {
+            padding: 15px;
+            height: 550px;
+            overflow-y: auto;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        
+        .welcome-banner { color: #ffffff; white-space: pre-wrap; margin-bottom: 15px; }
+        .output-history { white-space: pre-wrap; word-wrap: break-word; }
+        .input-line { display: flex; align-items: flex-start; margin-top: 5px; }
+        .prompt { color: #00ffaa; font-weight: bold; white-space: nowrap; margin-right: 8px; }
+        
+        .cmd-input {
+            background: transparent;
+            color: #ffffff;
+            border: none;
+            outline: none;
+            font-family: inherit;
+            font-size: inherit;
+            flex: 1;
+            padding: 0;
+            caret-color: #00ffaa;
+        }
+        
+        ::selection { background-color: #555555; color: #ffffff; }
+        .terminal-body::-webkit-scrollbar { width: 8px; }
+        .terminal-body::-webkit-scrollbar-track { background: #1e1e1e; }
+        .terminal-body::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; }
+        
+        .status-bar {
+            background-color: #222;
+            padding: 5px 15px;
+            font-size: 11px;
+            color: #888;
+            border-top: 1px solid #333;
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+</head>
+<body>
+
+<div class="terminal-container">
+    <div class="terminal-header">
+        <div class="terminal-title">Secure CRT Terminal Engine: {{ hostname }} ({{ ip }})</div>
+        <div class="window-buttons">
+            <div class="dot dot-yellow"></div>
+            <div class="dot dot-green"></div>
+            <div class="dot dot-red" onclick="window.close();" style="cursor:pointer;"></div>
+        </div>
+    </div>
+
+    <div class="terminal-body" id="terminalBody">
+        <div class="welcome-banner" id="initialBanner">{{ initial_banner|safe }}</div>
+        <div class="output-history" id="outputArea"></div>
+
+        <div class="input-line">
+            <span class="prompt" id="currentPrompt">
+                {% if vendor == 'Juniper' %}
+                    {master}<br><span style="color:#00ffaa;">{{ session['ssh_user'] }}@{{ hostname }}</span>&gt;
+                {% elif vendor == 'Huawei' %}
+                    &lt;<span style="color:#00ffaa;">{{ hostname }}</span>&gt;
+                {% elif vendor == 'Forti' %}
+                    <span style="color:#00ffaa;">{{ hostname }}</span> $
+                {% else %}
+                    <span style="color:#00ffaa;">{{ hostname }}</span>#
+                {% endif %}
+            </span>
+            <input type="text" id="cmdInput" class="cmd-input" autofocus autocomplete="off" spellcheck="false">
+        </div>
+    </div>
+    
+    <div class="status-bar">
+        <div>Vendor: <b>{{ vendor }}</b></div>
+        <div>Stateful Tunnel Link: <span id="linkStatus" style="color:#00ffaa; font-weight:bold;">Established</span></div>
+    </div>
+</div>
+
+<script>
+    const cmdInput = document.getElementById('cmdInput');
+    const outputArea = document.getElementById('outputArea');
+    const terminalBody = document.getElementById('terminalBody');
+    const currentPrompt = document.getElementById('currentPrompt');
+    const linkStatus = document.getElementById('linkStatus');
+    
+    let isCurrentlyMore = false;
+
+    function scrollToBottom() {
+        terminalBody.scrollTop = terminalBody.scrollHeight;
+    }
+
+    window.onload = function() {
+        scrollToBottom();
+        cmdInput.focus();
+    };
+
+    terminalBody.addEventListener('click', () => {
+        if (!window.getSelection().toString()) {
+            cmdInput.focus();
+        }
+    });
+
+    function sendCommand(commandText, isBreak = false) {
+        const promptText = currentPrompt.innerHTML;
+        
+        if (!isCurrentlyMore && !isBreak) {
+            outputArea.innerHTML += `<div class="input-line"><span class="prompt">${promptText}</span><span style="color:#fff;">${commandText}</span></div>`;
+        }
+        
+        cmdInput.value = '';
+        cmdInput.disabled = true;
+        scrollToBottom();
+
+        fetch('/execute_command', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ip: "{{ ip }}", command: commandText, is_break: isBreak })
+        })
+        .then(response => response.json())
+        .then(data => {
+            if (data.output) {
+                if (isCurrentlyMore) {
+                    outputArea.innerHTML = outputArea.innerHTML.replace(/-- More \(Space: Page.*<\/span>/g, '');
+                }
+                outputArea.innerHTML += `<div>${data.output}</div>`;
+                currentPrompt.innerHTML = ''; 
+                isCurrentlyMore = data.is_more;
+                
+                // لو السيرفر نبهنا إن حصل reconnect، نحدث الـ Status بشكل لطيف
+                if(data.output.includes("Auto-reconnecting")) {
+                    linkStatus.innerHTML = "Re-connecting...";
+                    linkStatus.style.color = "#ffc107";
+                } else {
+                    linkStatus.innerHTML = "Established";
+                    linkStatus.style.color = "#00ffaa";
+                }
+            }
+            cmdInput.disabled = false;
+            cmdInput.focus();
+            scrollToBottom();
+        })
+        .catch(error => {
+            outputArea.innerHTML += `<div style="color:#ffc107;"><br>[Session Reset - Automatically Recovering, Please press Enter to continue]<br></div>`;
+            cmdInput.disabled = false;
+            cmdInput.focus();
+            scrollToBottom();
+        });
+    }
+
+    cmdInput.addEventListener('keydown', function(e) {
+        if (isCurrentlyMore) {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                sendCommand(""); 
+            }
+            else if (e.key === ' ' || e.code === 'Space') {
+                e.preventDefault();
+                sendCommand(" "); 
+            }
+            else if (e.key.length === 1 && !e.ctrlKey && !e.altKey) {
+                e.preventDefault();
+                sendCommand("", true);
+            }
+        } else {
+            if (e.key === 'Enter') {
+                sendCommand(cmdInput.value);
+            }
+        }
+    });
+</script>
+
+</body>
+</html>
