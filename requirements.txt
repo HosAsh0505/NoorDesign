@@ -1,2 +1,4 @@
 Flask
 paramiko
+requests
+gunicorn
